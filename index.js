@@ -40,14 +40,23 @@ function verifyShopifyHmac(req) {
 // --- Build the public URL from Shopify payload ---
 function buildPublicUrl(topic, payload) {
   const host = "https://titandepot.co.uk";
-  if (topic.startsWith("products/")) return `${host}/products/${payload.handle}`;
-  if (topic.startsWith("collections/")) return `${host}/collections/${payload.handle}`;
+  const isDelete = topic.endsWith("delete");
+  if (topic.startsWith("products/")) {
+    if (isDelete) return null; // Shopify often omits handle on delete; skip
+    return payload?.handle ? `${host}/products/${payload.handle}` : null;
+  }
+  if (topic.startsWith("collections/")) {
+    if (isDelete) return null;
+    return payload?.handle ? `${host}/collections/${payload.handle}` : null;
+  }
   if (topic.startsWith("articles/")) {
-    const blogHandle = payload.blog?.handle || "news";
-    return `${host}/blogs/${blogHandle}/${payload.handle}`;
+    if (isDelete) return null;
+    const blogHandle = payload?.blog?.handle || "news";
+    return payload?.handle ? `${host}/blogs/${blogHandle}/${payload.handle}` : null;
   }
   return null;
 }
+
 
 // --- Send URLs to IndexNow (Bing + partners) ---
 async function submitIndexNow(urls) {
@@ -71,11 +80,17 @@ async function submitIndexNow(urls) {
 
 // --- Tell Google that sitemap is updated ---
 async function submitSitemapToGSC() {
+  if (!GOOGLE_CREDENTIALS_JSON) {
+    log.warn("GOOGLE_CREDENTIALS_JSON not set; skipping GSC sitemap submit.");
+    return;
+  }
   const creds = JSON.parse(GOOGLE_CREDENTIALS_JSON);
+  // 🔧 normalize private key newlines
+  const normalizedKey = (creds.private_key || "").replace(/\\n/g, "\n");
   const jwt = new google.auth.JWT(
     creds.client_email,
     null,
-    creds.private_key,
+    normalizedKey,
     ["https://www.googleapis.com/auth/webmasters"]
   );
   await jwt.authorize();
@@ -85,8 +100,9 @@ async function submitSitemapToGSC() {
     siteUrl: GSC_SITE_URL,
     feedpath: GSC_SITEMAP_URL,
   });
-  log.info("Sitemap submitted to Google Search Console");
+  log.info("GSC sitemap submitted OK");
 }
+
 
 // --- Webhook endpoint that Shopify will call ---
 app.post("/webhooks/shopify", async (req, res) => {
