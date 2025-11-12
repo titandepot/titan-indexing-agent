@@ -71,12 +71,12 @@ async function submitIndexNow(urls) {
     headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`IndexNow failed ${res.status}: ${text}`);
-  }
-  return true;
+  const text = await res.text();
+  if (!res.ok) throw new Error(`IndexNow ${res.status}: ${text}`);
+  // 👇 This line confirms success in your Render logs
+  log.info({ submitted: body.urlList.length, status: res.status }, "IndexNow submit OK");
 }
+
 
 // --- Tell Google that sitemap is updated ---
 async function submitSitemapToGSC() {
