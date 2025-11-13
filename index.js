@@ -1,5 +1,6 @@
 // ---------------------------------------------
 // Titan Depot Indexing Agent - Option B (Bing)
+// With cooldown to avoid repeat submits
 // ---------------------------------------------
 
 import express from "express";
@@ -8,11 +9,6 @@ import fetch from "node-fetch";
 import pino from "pino";
 import { google } from "googleapis";
 import { CronJob } from "cron";
-
-// Remember the last time we submitted each URL (in memory only)
-const recentSubmissions = new Map();
-const COOLDOWN_MS = 60 * 1000; // 60 seconds cooldown per URL
-
 
 const {
   PORT,
@@ -25,6 +21,10 @@ const {
 
 const log = pino({ transport: { target: "pino-pretty" } });
 const app = express();
+
+// 🔁 Cooldown memory: don't resubmit same URL too often
+const recentSubmissions = new Map();
+const COOLDOWN_MS = 60 * 1000; // 60 seconds cooldown per URL
 
 if (!BING_API_KEY) {
   log.warn("BING_API_KEY is not set; Bing submissions will be skipped until you add it.");
@@ -82,7 +82,7 @@ function buildPublicUrl(topic, payload) {
 }
 
 // -------------------
-// Bing URL Submission
+// Bing URL Submission (with cooldown)
 // -------------------
 async function submitToBing(urls) {
   if (!BING_API_KEY) {
@@ -132,26 +132,8 @@ async function submitToBing(urls) {
   log.info({ submitted: filtered.length, status: res.status }, "Bing submit OK");
 }
 
-
-  const endpoint =
-    "https://ssl.bing.com/webmaster/api.svc/json/SubmitUrlbatch?apikey=" + BING_API_KEY;
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const txt = await res.text();
-  if (!res.ok) {
-    throw new Error(`Bing submit ${res.status}: ${txt}`);
-  }
-
-  log.info({ submitted: urlList.length, status: res.status }, "Bing submit OK");
-}
-
 // -------------------
-// Google sitemap submit
+// Google sitemap submit (optional)
 // -------------------
 async function submitSitemapToGSC() {
   if (!GOOGLE_CREDENTIALS_JSON) {
