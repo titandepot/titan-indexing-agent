@@ -1,129 +1,174 @@
-// -----------------------------
-// Titan Depot Indexing Agent
-// -----------------------------
+// ---------------------------------------------
+// Titan Depot Indexing Agent - Option B (Bing)
+// ---------------------------------------------
 
 import express from "express";
-import crypto from "crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import fetch from "node-fetch";
 import pino from "pino";
 import { google } from "googleapis";
 import { CronJob } from "cron";
 
-// === Read environment variables (you’ll set these on Render later) ===
 const {
-  PORT = 8080,
+  PORT,
   SHOPIFY_WEBHOOK_SECRET,
-  INDEXNOW_KEY,
-  INDEXNOW_KEY_URL,
-  GSC_SITE_URL,
-  GSC_SITEMAP_URL,
+  BING_API_KEY,
+  GSC_SITE_URL = "https://titandepot.co.uk/",
+  GSC_SITEMAP_URL = "https://titandepot.co.uk/sitemap.xml",
   GOOGLE_CREDENTIALS_JSON,
 } = process.env;
 
 const log = pino({ transport: { target: "pino-pretty" } });
 const app = express();
 
-// Shopify sends a raw body; we must not parse JSON yet
-app.use("/webhooks/shopify", express.raw({ type: "*/*" }));
-
-// --- Verify Shopify webhook using HMAC ---
-function verifyShopifyHmac(req) {
-  const hmac = req.get("x-shopify-hmac-sha256");
-  if (!hmac) return false;
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
-    .update(req.body, "utf8")
-    .digest("base64");
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
+if (!BING_API_KEY) {
+  log.warn("BING_API_KEY is not set; Bing submissions will be skipped until you add it.");
+}
+if (!SHOPIFY_WEBHOOK_SECRET) {
+  log.warn("SHOPIFY_WEBHOOK_SECRET is not set; Shopify webhooks will fail verification.");
 }
 
-// --- Build the public URL from Shopify payload ---
+// Helpers
+function getHostBase() {
+  return "https://titandepot.co.uk";
+}
+
+// Simple pages
+app.get("/", (_req, res) => res.send("Titan Indexing Agent (Bing) is running"));
+app.get("/healthz", (_req, res) => res.send("ok"));
+
+// Raw body for Shopify
+app.use("/webhooks/shopify", express.raw({ type: "*/*" }));
+
+function verifyShopifyHmac(req) {
+  const hmacHeader = req.get("x-shopify-hmac-sha256");
+  if (!hmacHeader || !SHOPIFY_WEBHOOK_SECRET) return false;
+  const digest = createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+    .update(req.body, "utf8")
+    .digest("base64");
+  try {
+    return timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+  } catch {
+    return false;
+  }
+}
+
 function buildPublicUrl(topic, payload) {
-  const host = "https://titandepot.co.uk";
+  const host = getHostBase();
   const isDelete = topic.endsWith("delete");
+
   if (topic.startsWith("products/")) {
-    if (isDelete) return null; // Shopify often omits handle on delete; skip
+    if (isDelete) return null; // Shopify often omits handle on delete
     return payload?.handle ? `${host}/products/${payload.handle}` : null;
   }
+
   if (topic.startsWith("collections/")) {
     if (isDelete) return null;
     return payload?.handle ? `${host}/collections/${payload.handle}` : null;
   }
+
   if (topic.startsWith("articles/")) {
     if (isDelete) return null;
     const blogHandle = payload?.blog?.handle || "news";
     return payload?.handle ? `${host}/blogs/${blogHandle}/${payload.handle}` : null;
   }
+
   return null;
 }
 
+// -------------------
+// Bing URL Submission
+// -------------------
+async function submitToBing(urls) {
+  if (!BING_API_KEY) {
+    log.warn("BING_API_KEY missing; skipping Bing submit.");
+    return;
+  }
 
-// --- Send URLs to IndexNow (Bing + partners) ---
-async function submitIndexNow(urls) {
+  const urlList = Array.isArray(urls) ? urls : [urls];
   const body = {
-    host: "titandepot.co.uk",
-    key: INDEXNOW_KEY,
-    keyLocation: INDEXNOW_KEY_URL,
-    urlList: Array.isArray(urls) ? urls : [urls],
+    siteUrl: getHostBase() + "/",
+    urlList,
   };
-  const res = await fetch("https://api.indexnow.org/indexnow", {
+
+  const endpoint =
+    "https://ssl.bing.com/webmaster/api.svc/json/SubmitUrlbatch?apikey=" + BING_API_KEY;
+
+  const res = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`IndexNow ${res.status}: ${text}`);
-  // 👇 This line confirms success in your Render logs
-  log.info({ submitted: body.urlList.length, status: res.status }, "IndexNow submit OK");
+
+  const txt = await res.text();
+  if (!res.ok) {
+    throw new Error(`Bing submit ${res.status}: ${txt}`);
+  }
+
+  log.info({ submitted: urlList.length, status: res.status }, "Bing submit OK");
 }
 
-
-// --- Tell Google that sitemap is updated ---
+// -------------------
+// Google sitemap submit
+// -------------------
 async function submitSitemapToGSC() {
   if (!GOOGLE_CREDENTIALS_JSON) {
     log.warn("GOOGLE_CREDENTIALS_JSON not set; skipping GSC sitemap submit.");
     return;
   }
+
   const creds = JSON.parse(GOOGLE_CREDENTIALS_JSON);
-  // 🔧 normalize private key newlines
   const normalizedKey = (creds.private_key || "").replace(/\\n/g, "\n");
+
   const jwt = new google.auth.JWT(
     creds.client_email,
     null,
     normalizedKey,
     ["https://www.googleapis.com/auth/webmasters"]
   );
+
   await jwt.authorize();
   const webmasters = google.webmasters("v3");
+
   await webmasters.sitemaps.submit({
     auth: jwt,
     siteUrl: GSC_SITE_URL,
     feedpath: GSC_SITEMAP_URL,
   });
+
   log.info("GSC sitemap submitted OK");
 }
 
-
-// --- Webhook endpoint that Shopify will call ---
+// -------------------
+// Shopify webhook handler
+// -------------------
 app.post("/webhooks/shopify", async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req)) return res.status(401).send("Invalid HMAC");
-    const topic = req.get("x-shopify-topic") || "";
-    const payload = JSON.parse(req.body.toString("utf8"));
-    const url = buildPublicUrl(topic, payload);
-
-    const urls = [];
-    if (url) urls.push(url);
-    // Always include main pages
-    urls.push("https://titandepot.co.uk/");
-    urls.push("https://titandepot.co.uk/collections/all");
-
-    await submitIndexNow(urls);
-    if (topic.endsWith("create") || topic.startsWith("collections/")) {
-      await submitSitemapToGSC();
+    if (!verifyShopifyHmac(req)) {
+      log.warn("Invalid Shopify HMAC");
+      return res.status(401).send("Invalid HMAC");
     }
 
-    log.info({ topic, urls }, "Indexed");
+    const topic = req.get("x-shopify-topic") || "";
+    const payload = JSON.parse(req.body.toString("utf8"));
+    const singleUrl = buildPublicUrl(topic, payload);
+
+    const urls = [];
+    if (singleUrl) urls.push(singleUrl);
+    urls.push(`${getHostBase()}/`);
+    urls.push(`${getHostBase()}/collections/all`);
+
+    await submitToBing(urls);
+
+    if (topic.endsWith("create") || topic.startsWith("collections/")) {
+      try {
+        await submitSitemapToGSC();
+      } catch (e) {
+        log.warn(e, "GSC submit warning");
+      }
+    }
+
+    log.info({ topic, urls }, "Webhook processed");
     res.status(200).send("OK");
   } catch (err) {
     log.error(err, "Webhook error");
@@ -131,14 +176,14 @@ app.post("/webhooks/shopify", async (req, res) => {
   }
 });
 
-// --- Daily job at 08:15 London time ---
+// Daily job 08:15 London
 new CronJob(
   "15 8 * * *",
   async () => {
     try {
-      await submitIndexNow([
-        "https://titandepot.co.uk/",
-        "https://titandepot.co.uk/sitemap.xml",
+      await submitToBing([
+        `${getHostBase()}/`,
+        `${getHostBase()}/sitemap.xml`,
       ]);
       await submitSitemapToGSC();
       log.info("Daily health submit complete");
@@ -151,7 +196,11 @@ new CronJob(
   "Europe/London"
 );
 
-// --- Simple health page ---
-app.get("/healthz", (req, res) => res.send("ok"));
+// Start server
+const listenPort = Number(PORT) || 8080;
+app.listen(listenPort, "0.0.0.0", () => {
+  log.info(`Indexing agent (Bing) running on :${listenPort}`);
+});
 
-app.listen(PORT, () => log.info(`Indexing agent running on port ${PORT}`));
+process.on("unhandledRejection", (err) => log.error(err, "unhandledRejection"));
+process.on("uncaughtException", (err) => log.error(err, "uncaughtException"));
