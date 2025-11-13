@@ -9,6 +9,11 @@ import pino from "pino";
 import { google } from "googleapis";
 import { CronJob } from "cron";
 
+// Remember the last time we submitted each URL (in memory only)
+const recentSubmissions = new Map();
+const COOLDOWN_MS = 60 * 1000; // 60 seconds cooldown per URL
+
+
 const {
   PORT,
   SHOPIFY_WEBHOOK_SECRET,
@@ -85,11 +90,48 @@ async function submitToBing(urls) {
     return;
   }
 
-  const urlList = Array.isArray(urls) ? urls : [urls];
+  const now = Date.now();
+  const incomingList = Array.isArray(urls) ? urls : [urls];
+
+  // Filter out URLs we've sent very recently
+  const filtered = [];
+  for (const url of incomingList) {
+    const last = recentSubmissions.get(url) || 0;
+    if (now - last > COOLDOWN_MS) {
+      filtered.push(url);
+      recentSubmissions.set(url, now);
+    } else {
+      log.info({ url }, "Skipped Bing submit for URL (cooldown)");
+    }
+  }
+
+  if (filtered.length === 0) {
+    log.info("No URLs to submit to Bing after cooldown filter");
+    return;
+  }
+
   const body = {
     siteUrl: getHostBase() + "/",
-    urlList,
+    urlList: filtered,
   };
+
+  const endpoint =
+    "https://ssl.bing.com/webmaster/api.svc/json/SubmitUrlbatch?apikey=" + BING_API_KEY;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const txt = await res.text();
+  if (!res.ok) {
+    throw new Error(`Bing submit ${res.status}: ${txt}`);
+  }
+
+  log.info({ submitted: filtered.length, status: res.status }, "Bing submit OK");
+}
+
 
   const endpoint =
     "https://ssl.bing.com/webmaster/api.svc/json/SubmitUrlbatch?apikey=" + BING_API_KEY;
